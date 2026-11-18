@@ -9,11 +9,13 @@
 //       (b) a trailing stop: the close falls 80 bps below the highest close
 //           seen since entry, or
 //       (c) EMA(36) crosses back down through EMA(96).
-//   - After a losing exit, sit out for 300 bars before the next entry. This
-//     cooldown is what keeps the bot from churning in choppy, directionless
-//     stretches: on the dev window the slow-trend signals catch the one big
-//     multi-hour rally and the cooldown skips most of the whipsaw entries
-//     that follow it.
+//   - After any exit, sit out for 300 bars before the next entry. An exit
+//     means the trend just ended — win or loss — and the bars right after it
+//     are the choppiest, so re-entering at once only buys back into them.
+//     (Revisi: cooldown dulu hanya setelah exit yang rugi; diuji di dev
+//     window, cooldown-setelah-exit-apa-pun menaikkan net PnL +$5.26 -> +$6.33
+//     dan menurunkan max drawdown 1.31% -> 1.20%, dengan trade yang sama
+//     persis untuk cooldown 270-300 bar.)
 //
 // Everything is deterministic: plain integer prices from the bars, float64
 // EMAs seeded exactly as the mean of the first span of closes, no wall
@@ -23,8 +25,8 @@
 //
 // Dev-window backtest (exact replay of the harness fill math, fee 4 bps +
 // slippage 2 bps + constant-product impact vs bar open depth, fills at the
-// next bar's open): net PnL +$5.26 on a $1,000 start, 4 trades, max
-// drawdown 1.30%. The same replay gives buy-and-hold -$31.63, EMA(8/21)
+// next bar's open): net PnL +$6.33 on a $1,000 start, 4 trades, max
+// drawdown 1.20%. The same replay gives buy-and-hold -$31.63, EMA(8/21)
 // -$148.17, momentum(24) -$180.67, RSI(14) -$112.92, Bollinger(20,2)
 // -$133.45.
 
@@ -39,7 +41,7 @@ const SLOW_EMA = 96; // bars
 const BREAKOUT_BARS = 240; // bars for the entry high
 const EXIT_LOW_BARS = 60; // bars for the exit low
 const TRAIL_BPS = 80; // trailing stop below the peak close since entry
-const COOLDOWN_BARS = 300; // bars to sit out after a losing exit
+const COOLDOWN_BARS = 300; // bars to sit out after any exit (win or loss)
 
 /** One EMA: the closes it has seen until it starts, then its value. */
 interface Ema {
@@ -86,8 +88,8 @@ class TrendBot {
   prevGap: number | null = null;
   /** Highest close since the current entry. */
   peak = 0;
+  /** Sequence number of the last exit (any outcome). */
   lastExitSeq = -1e9;
-  lastExitLost = false;
 
   onBatch(state: BarsState, batch: { bars: Bar[] }): (BuyInput | SellInput)[] {
     // Only the fresh bar of this batch moves the indicators. A batch
@@ -130,7 +132,9 @@ class TrendBot {
   ): (BuyInput | SellInput)[] {
     // Both EMAs and a full breakout look-back must exist first.
     if (gap === null || this.closes.length <= BREAKOUT_BARS) return [];
-    if (this.lastExitLost && state.seq - this.lastExitSeq < COOLDOWN_BARS) return [];
+    // Every exit starts the cooldown, win or loss: the trend just ended,
+    // so the next 300 bars are the chop to sit out, not a fresh entry.
+    if (state.seq - this.lastExitSeq < COOLDOWN_BARS) return [];
 
     const crossedUp = prevGap !== null && prevGap <= 0 && gap > 0;
     const brokeOut = close > maxOf(this.closes.slice(-BREAKOUT_BARS - 1, -1));
@@ -161,8 +165,7 @@ class TrendBot {
 
     if (!brokeDown && !trailed && !crossedDown) return [];
 
-    // Mark the exit: a loss starts the cooldown, a win does not.
-    this.lastExitLost = state.value(SYMBOL, held.qty) < held.cost;
+    // Mark the exit: it starts the cooldown whatever its outcome was.
     this.lastExitSeq = state.seq;
     this.peak = 0;
     return [{ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
